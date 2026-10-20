@@ -43,7 +43,7 @@ jobs:
           cutoff=$(date -u -d "-${KEEP_HOURS} hours" +%Y-%m-%dT%H:%M:%S)
           aws s3api list-objects-v2 --bucket "$BUCKET" \
             --query "Contents[?LastModified<'${cutoff}'].Key" --output text |
-            tr '\t' '\n' | grep -v -e '^None$' -e '^$' |
+            tr '\t' '\n' | { grep -v -e '^None$' -e '^$' || true; } |
             while read -r key; do aws s3 rm "s3://$BUCKET/$key" --only-show-errors; done
           echo "old files cleaned"
 
