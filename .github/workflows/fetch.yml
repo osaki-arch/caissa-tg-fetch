@@ -39,6 +39,7 @@ jobs:
 
       - name: Delete files older than ${{ env.KEEP_HOURS }}h
         run: |
+          set -o pipefail
           cutoff=$(date -u -d "-${KEEP_HOURS} hours" +%Y-%m-%dT%H:%M:%S)
           aws s3api list-objects-v2 --bucket "$BUCKET" \
             --query "Contents[?LastModified<'${cutoff}'].Key" --output text |
@@ -62,7 +63,9 @@ jobs:
                --storage "type=file,path=$RUNNER_TEMP/tdl.json" \
                --template '{{ .DialogID }}_{{ .MessageID }}_{{ filenamify .FileName }}' \
                -t 8 --disable-progress-ps > "$RUNNER_TEMP/tdl.log" 2>&1; then
-            echo "::error::download failed (log hidden: it contains file names)"
+            # Only error lines: progress lines carry file names, errors don't.
+            grep -iE 'error|fail|unauthori|login|session|invalid|private|not found|flood|denied' "$RUNNER_TEMP/tdl.log" | tail -n 8
+            echo "::error::download failed"
             exit 1
           fi
           count=$(find "$RUNNER_TEMP/out" -type f | wc -l)
