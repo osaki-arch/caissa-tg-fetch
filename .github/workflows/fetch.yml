@@ -57,7 +57,11 @@ jobs:
           LINK: ${{ inputs.link }}
           TDL_SESSION: ${{ secrets.TDL_SESSION }}
         run: |
-          echo "$TDL_SESSION" | base64 -d > "$RUNNER_TEMP/tdl.json"
+          # The secret may hold the raw tdl.json or its base64.
+          case "$TDL_SESSION" in
+            \{*) printf '%s' "$TDL_SESSION" > "$RUNNER_TEMP/tdl.json" ;;
+            *) printf '%s' "$TDL_SESSION" | base64 -d > "$RUNNER_TEMP/tdl.json" ;;
+          esac
           mkdir -p "$RUNNER_TEMP/out"
           if ! "$RUNNER_TEMP/tdl" dl -u "$LINK" -d "$RUNNER_TEMP/out" \
                --storage "type=file,path=$RUNNER_TEMP/tdl.json" \
