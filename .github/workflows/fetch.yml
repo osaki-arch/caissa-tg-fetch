@@ -16,7 +16,6 @@ concurrency: fetch
 
 env:
   TDL_VERSION: v0.20.4
-  LINK_HOURS: 12
   KEEP_HOURS: 48
   AWS_DEFAULT_REGION: us-east-1
   AWS_ENDPOINT_URL: ${{ secrets.ARVAN_ENDPOINT }}
@@ -81,13 +80,15 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
-          msg="ویدیو آماده‌ی آپلود ریموت نگاوید است (لینک ${LINK_HOURS} ساعت اعتبار دارد):"
+          # Negavid's form rejects presigned URLs (query string), so the object is
+          # public-read under an unguessable name and the URL ends in the extension.
+          msg="ویدیو آماده‌ی آپلود ریموت نگاوید است (لینک ${KEEP_HOURS} ساعت می‌ماند):"
           for f in "$RUNNER_TEMP"/out/*; do
             name=$(basename "$f")
-            ext="${name##*.}"
-            key="$(echo "$name" | cut -d_ -f1-2).${ext}"
-            aws s3 cp "$f" "s3://$BUCKET/$key" --only-show-errors
-            url=$(aws s3 presign "s3://$BUCKET/$key" --expires-in $((LINK_HOURS * 3600)))
+            ext=$(echo "${name##*.}" | tr '[:upper:]' '[:lower:]')
+            key="$(openssl rand -hex 16).${ext}"
+            aws s3 cp "$f" "s3://$BUCKET/$key" --acl public-read --only-show-errors
+            url="${AWS_ENDPOINT_URL%/}/$BUCKET/$key"
             msg="$msg"$'\n\n'"$name"$'\n'"$url"
           done
           curl -sS -o /dev/null -w "telegram: %{http_code}\n" \
