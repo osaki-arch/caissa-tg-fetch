@@ -1,0 +1,90 @@
+# Telegram → Arvan Object Storage → link for Negavid's remote upload.
+#
+# The repo is public (unlimited Actions minutes), so the logs must never show
+# the message link, the file name or the download link. The link goes to the
+# owner over the Telegram bot instead.
+name: fetch
+
+on:
+  workflow_dispatch:
+    inputs:
+      link:
+        description: Telegram message link (t.me/...)
+        required: true
+
+concurrency: fetch
+
+env:
+  TDL_VERSION: v0.20.4
+  LINK_HOURS: 12
+  KEEP_HOURS: 48
+  AWS_DEFAULT_REGION: us-east-1
+  AWS_ENDPOINT_URL: ${{ secrets.ARVAN_ENDPOINT }}
+  AWS_ACCESS_KEY_ID: ${{ secrets.ARVAN_ACCESS_KEY }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.ARVAN_SECRET_KEY }}
+  # aws-cli ≥ 2.23 adds CRC checksums that S3-compatible stores reject.
+  AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+  AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+  BUCKET: ${{ secrets.ARVAN_BUCKET }}
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Mask the link
+        env:
+          LINK: ${{ inputs.link }}
+        run: echo "::add-mask::$LINK"
+
+      - name: Delete files older than ${{ env.KEEP_HOURS }}h
+        run: |
+          cutoff=$(date -u -d "-${KEEP_HOURS} hours" +%Y-%m-%dT%H:%M:%S)
+          aws s3api list-objects-v2 --bucket "$BUCKET" \
+            --query "Contents[?LastModified<'${cutoff}'].Key" --output text |
+            tr '\t' '\n' | grep -v -e '^None$' -e '^$' |
+            while read -r key; do aws s3 rm "s3://$BUCKET/$key" --only-show-errors; done
+          echo "old files cleaned"
+
+      - name: Install tdl
+        run: |
+          curl -sSL "https://github.com/iyear/tdl/releases/download/${TDL_VERSION}/tdl_Linux_64bit.tar.gz" |
+            tar xz -C "$RUNNER_TEMP" tdl
+
+      - name: Download from Telegram
+        env:
+          LINK: ${{ inputs.link }}
+          TDL_SESSION: ${{ secrets.TDL_SESSION }}
+        run: |
+          echo "$TDL_SESSION" | base64 -d > "$RUNNER_TEMP/tdl.json"
+          mkdir -p "$RUNNER_TEMP/out"
+          if ! "$RUNNER_TEMP/tdl" dl -u "$LINK" -d "$RUNNER_TEMP/out" \
+               --storage "type=file,path=$RUNNER_TEMP/tdl.json" \
+               --template '{{ .DialogID }}_{{ .MessageID }}_{{ filenamify .FileName }}' \
+               -t 8 --disable-progress-ps > "$RUNNER_TEMP/tdl.log" 2>&1; then
+            echo "::error::download failed (log hidden: it contains file names)"
+            exit 1
+          fi
+          count=$(find "$RUNNER_TEMP/out" -type f | wc -l)
+          [ "$count" -ge 1 ] || { echo "::error::nothing downloaded"; exit 1; }
+          echo "downloaded $count file(s), $(du -sh "$RUNNER_TEMP/out" | cut -f1)"
+
+      - name: Upload to Arvan and send the links
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          msg="ویدیو آماده‌ی آپلود ریموت نگاوید است (لینک ${LINK_HOURS} ساعت اعتبار دارد):"
+          for f in "$RUNNER_TEMP"/out/*; do
+            name=$(basename "$f")
+            ext="${name##*.}"
+            key="$(echo "$name" | cut -d_ -f1-2).${ext}"
+            aws s3 cp "$f" "s3://$BUCKET/$key" --only-show-errors
+            url=$(aws s3 presign "s3://$BUCKET/$key" --expires-in $((LINK_HOURS * 3600)))
+            msg="$msg"$'\n\n'"$name"$'\n'"$url"
+          done
+          curl -sS -o /dev/null -w "telegram: %{http_code}\n" \
+            "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TG_CHAT_ID}" \
+            --data-urlencode "text=${msg}" \
+            --data-urlencode "disable_web_page_preview=true"
