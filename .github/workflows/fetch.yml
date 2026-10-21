@@ -90,10 +90,11 @@ jobs:
         run: |
           # Negavid's form rejects presigned URLs (query string), so the object is
           # public-read under an unguessable name and the URL ends in the extension.
-          # Small parts so a dropped connection only costs one part's retry.
+          # Small parts so a dropped connection only costs one part's retry;
+          # many in parallel because the long route caps each connection.
           aws configure set default.s3.preferred_transfer_client classic
           aws configure set default.s3.multipart_chunksize 16MB
-          aws configure set default.s3.max_concurrent_requests 4
+          aws configure set default.s3.max_concurrent_requests 16
           msg="ویدیو آماده‌ی آپلود ریموت نگاوید است (لینک ${KEEP_HOURS} ساعت می‌ماند):"
           for f in "$RUNNER_TEMP"/out/*; do
             name=$(basename "$f")
