@@ -24,6 +24,9 @@ env:
   # aws-cli ≥ 2.23 adds CRC checksums that S3-compatible stores reject.
   AWS_REQUEST_CHECKSUM_CALCULATION: when_required
   AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+  # The GitHub → Arvan route drops long connections; retry each part.
+  AWS_RETRY_MODE: standard
+  AWS_MAX_ATTEMPTS: 10
   BUCKET: ${{ secrets.ARVAN_BUCKET }}
 
 jobs:
@@ -82,12 +85,26 @@ jobs:
         run: |
           # Negavid's form rejects presigned URLs (query string), so the object is
           # public-read under an unguessable name and the URL ends in the extension.
+          # Small parts so a dropped connection only costs one part's retry.
+          aws configure set default.s3.preferred_transfer_client classic
+          aws configure set default.s3.multipart_chunksize 16MB
+          aws configure set default.s3.max_concurrent_requests 4
           msg="ویدیو آماده‌ی آپلود ریموت نگاوید است (لینک ${KEEP_HOURS} ساعت می‌ماند):"
           for f in "$RUNNER_TEMP"/out/*; do
             name=$(basename "$f")
             ext=$(echo "${name##*.}" | tr '[:upper:]' '[:lower:]')
             key="$(openssl rand -hex 16).${ext}"
-            aws s3 cp "$f" "s3://$BUCKET/$key" --acl public-read --only-show-errors
+            echo "uploading $(du -h "$f" | cut -f1)"
+            ok=0
+            for attempt in 1 2 3; do
+              if aws s3 cp "$f" "s3://$BUCKET/$key" --acl public-read --only-show-errors \
+                   2> "$RUNNER_TEMP/aws.log"; then
+                ok=1; break
+              fi
+              # aws prints the local path (= file name); show only the error code.
+              echo "upload attempt $attempt failed: $(grep -oE 'AWS_ERROR_[A-Z_]+|\([A-Za-z]+\)|[A-Za-z]+Error' "$RUNNER_TEMP/aws.log" | sort -u | tr '\n' ' ')"
+            done
+            [ "$ok" = 1 ] || { echo "::error::upload failed"; exit 1; }
             url="${AWS_ENDPOINT_URL%/}/$BUCKET/$key"
             msg="$msg"$'\n\n'"$name"$'\n'"$url"
           done
