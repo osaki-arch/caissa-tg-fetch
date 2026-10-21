@@ -40,6 +40,11 @@ jobs:
         run: echo "::add-mask::$LINK"
 
       - name: Delete files older than ${{ env.KEEP_HOURS }}h
+        # Housekeeping only; a slow Arvan route must not block the download.
+        continue-on-error: true
+        timeout-minutes: 2
+        env:
+          AWS_MAX_ATTEMPTS: 2
         run: |
           set -o pipefail
           cutoff=$(date -u -d "-${KEEP_HOURS} hours" +%Y-%m-%dT%H:%M:%S)
