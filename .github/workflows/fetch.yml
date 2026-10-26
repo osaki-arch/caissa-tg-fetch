@@ -8,10 +8,12 @@ name: fetch
 on:
   workflow_dispatch:
     inputs:
-      link:
-        description: Telegram message link (t.me/...)
+      links:
+        description: Telegram message links (t.me/...), separated by spaces
         required: true
 
+# One run at a time: parallel runs would use the tdl session from several IPs
+# and Telegram may revoke it (AUTH_KEY_DUPLICATED). Queue videos in one run instead.
 concurrency: fetch
 
 env:
@@ -32,12 +34,14 @@ env:
 jobs:
   fetch:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 300
     steps:
-      - name: Mask the link
+      - name: Mask the links
         env:
-          LINK: ${{ inputs.link }}
-        run: echo "::add-mask::$LINK"
+          LINKS: ${{ inputs.links }}
+        run: |
+          echo "::add-mask::$LINKS"
+          for link in ${LINKS//,/ }; do echo "::add-mask::$link"; done
 
       - name: Delete files older than ${{ env.KEEP_HOURS }}h
         # Housekeeping only; a slow Arvan route must not block the download.
@@ -59,35 +63,18 @@ jobs:
           curl -sSL "https://github.com/iyear/tdl/releases/download/${TDL_VERSION}/tdl_Linux_64bit.tar.gz" |
             tar xz -C "$RUNNER_TEMP" tdl
 
-      - name: Download from Telegram
+      - name: Fetch each video, upload it and send its link
         env:
-          LINK: ${{ inputs.link }}
+          LINKS: ${{ inputs.links }}
           TDL_SESSION: ${{ secrets.TDL_SESSION }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
           # The secret may hold the raw tdl.json or its base64.
           case "$TDL_SESSION" in
             \{*) printf '%s' "$TDL_SESSION" > "$RUNNER_TEMP/tdl.json" ;;
             *) printf '%s' "$TDL_SESSION" | base64 -d > "$RUNNER_TEMP/tdl.json" ;;
           esac
-          mkdir -p "$RUNNER_TEMP/out"
-          if ! "$RUNNER_TEMP/tdl" dl -u "$LINK" -d "$RUNNER_TEMP/out" \
-               --storage "type=file,path=$RUNNER_TEMP/tdl.json" \
-               --template '{{ .DialogID }}_{{ .MessageID }}_{{ filenamify .FileName }}' \
-               -t 8 --disable-progress-ps > "$RUNNER_TEMP/tdl.log" 2>&1; then
-            # Only error lines: progress lines carry file names, errors don't.
-            grep -iE 'error|fail|unauthori|login|session|invalid|private|not found|flood|denied' "$RUNNER_TEMP/tdl.log" | tail -n 8
-            echo "::error::download failed"
-            exit 1
-          fi
-          count=$(find "$RUNNER_TEMP/out" -type f | wc -l)
-          [ "$count" -ge 1 ] || { echo "::error::nothing downloaded"; exit 1; }
-          echo "downloaded $count file(s), $(du -sh "$RUNNER_TEMP/out" | cut -f1)"
-
-      - name: Upload to Arvan and send the links
-        env:
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        run: |
           # Negavid's form rejects presigned URLs (query string), so the object is
           # public-read under an unguessable name and the URL ends in the extension.
           # Small parts so a dropped connection only costs one part's retry;
@@ -95,27 +82,75 @@ jobs:
           aws configure set default.s3.preferred_transfer_client classic
           aws configure set default.s3.multipart_chunksize 16MB
           aws configure set default.s3.max_concurrent_requests 16
-          msg="ویدیو آماده‌ی آپلود ریموت نگاوید است (لینک ${KEEP_HOURS} ساعت می‌ماند):"
-          for f in "$RUNNER_TEMP"/out/*; do
-            name=$(basename "$f")
-            ext=$(echo "${name##*.}" | tr '[:upper:]' '[:lower:]')
-            key="$(openssl rand -hex 16).${ext}"
-            echo "uploading $(du -h "$f" | cut -f1)"
-            ok=0
-            for attempt in 1 2 3; do
-              if aws s3 cp "$f" "s3://$BUCKET/$key" --acl public-read --only-show-errors \
-                   2> "$RUNNER_TEMP/aws.log"; then
-                ok=1; break
+
+          send() {
+            curl -sS -o /dev/null -w "telegram: %{http_code}\n" \
+              "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TG_CHAT_ID}" \
+              --data-urlencode "text=$1" \
+              --data-urlencode "disable_web_page_preview=true" || true
+          }
+
+          read -ra links <<< "${LINKS//,/ }"
+          total=${#links[@]}
+          done_count=0
+          failed=()
+          # Each link is handled to the end before the next, so its Negavid link
+          # arrives early and one bad link doesn't stop the rest.
+          for i in "${!links[@]}"; do
+            n=$((i + 1))
+            echo "::group::video $n/$total"
+            out="$RUNNER_TEMP/out/$n"
+            mkdir -p "$out"
+            if ! "$RUNNER_TEMP/tdl" dl -u "${links[$i]}" -d "$out" \
+                 --storage "type=file,path=$RUNNER_TEMP/tdl.json" \
+                 --template '{{ .DialogID }}_{{ .MessageID }}_{{ filenamify .FileName }}' \
+                 -t 8 --disable-progress-ps > "$RUNNER_TEMP/tdl.log" 2>&1; then
+              # Only error lines: progress lines carry file names, errors don't.
+              grep -iE 'error|fail|unauthori|login|session|invalid|private|not found|flood|denied' "$RUNNER_TEMP/tdl.log" | tail -n 8
+              echo "::error::video $n: download failed"
+              failed+=("$n"); echo "::endgroup::"; continue
+            fi
+            if [ -z "$(find "$out" -type f)" ]; then
+              echo "::error::video $n: nothing downloaded"
+              failed+=("$n"); echo "::endgroup::"; continue
+            fi
+            echo "downloaded $(du -sh "$out" | cut -f1)"
+
+            msg="ویدیو $n از $total آماده‌ی آپلود ریموت نگاوید است (لینک ${KEEP_HOURS} ساعت می‌ماند):"
+            ok=1
+            for f in "$out"/*; do
+              name=$(basename "$f")
+              ext=$(echo "${name##*.}" | tr '[:upper:]' '[:lower:]')
+              key="$(openssl rand -hex 16).${ext}"
+              echo "uploading $(du -h "$f" | cut -f1)"
+              uploaded=0
+              for attempt in 1 2 3; do
+                if aws s3 cp "$f" "s3://$BUCKET/$key" --acl public-read --only-show-errors \
+                     2> "$RUNNER_TEMP/aws.log"; then
+                  uploaded=1; break
+                fi
+                # aws prints the local path (= file name); show only the error code.
+                echo "upload attempt $attempt failed: $(grep -oE 'AWS_ERROR_[A-Z_]+|\([A-Za-z]+\)|[A-Za-z]+Error' "$RUNNER_TEMP/aws.log" | sort -u | tr '\n' ' ')"
+              done
+              if [ "$uploaded" = 1 ]; then
+                msg="$msg"$'\n\n'"$name"$'\n'"${AWS_ENDPOINT_URL%/}/$BUCKET/$key"
+              else
+                ok=0
               fi
-              # aws prints the local path (= file name); show only the error code.
-              echo "upload attempt $attempt failed: $(grep -oE 'AWS_ERROR_[A-Z_]+|\([A-Za-z]+\)|[A-Za-z]+Error' "$RUNNER_TEMP/aws.log" | sort -u | tr '\n' ' ')"
             done
-            [ "$ok" = 1 ] || { echo "::error::upload failed"; exit 1; }
-            url="${AWS_ENDPOINT_URL%/}/$BUCKET/$key"
-            msg="$msg"$'\n\n'"$name"$'\n'"$url"
+            rm -rf "$out"
+            if [ "$ok" = 1 ]; then
+              send "$msg"
+              done_count=$((done_count + 1))
+            else
+              echo "::error::video $n: upload failed"
+              failed+=("$n")
+            fi
+            echo "::endgroup::"
           done
-          curl -sS -o /dev/null -w "telegram: %{http_code}\n" \
-            "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
-            --data-urlencode "chat_id=${TG_CHAT_ID}" \
-            --data-urlencode "text=${msg}" \
-            --data-urlencode "disable_web_page_preview=true"
+
+          summary="تمام شد: $done_count از $total ویدیو موفق."
+          [ ${#failed[@]} -eq 0 ] || summary="$summary"$'\n'"ناموفق: ${failed[*]}"
+          send "$summary"
+          [ ${#failed[@]} -eq 0 ]
