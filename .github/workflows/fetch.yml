@@ -18,7 +18,7 @@ concurrency: fetch
 
 env:
   TDL_VERSION: v0.20.4
-  KEEP_HOURS: 48
+  KEEP_HOURS: 24
   AWS_DEFAULT_REGION: us-east-1
   AWS_ENDPOINT_URL: ${{ secrets.ARVAN_ENDPOINT }}
   AWS_ACCESS_KEY_ID: ${{ secrets.ARVAN_ACCESS_KEY }}
@@ -34,12 +34,20 @@ env:
 jobs:
   fetch:
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    # GitHub's hard cap for a job. Videos still waiting after BUDGET_MINUTES go
+    # to a fresh run of this workflow, so a long list never hits the cap.
+    timeout-minutes: 360
+    env:
+      BUDGET_MINUTES: 240
+    permissions:
+      actions: write
+      contents: read
     steps:
       - name: Mask the links
         env:
           LINKS: ${{ inputs.links }}
         run: |
+          echo "JOB_START=$(date +%s)" >> "$GITHUB_ENV"
           echo "::add-mask::$LINKS"
           for link in ${LINKS//,/ }; do echo "::add-mask::$link"; done
 
@@ -69,6 +77,7 @@ jobs:
           TDL_SESSION: ${{ secrets.TDL_SESSION }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           # The secret may hold the raw tdl.json or its base64.
           case "$TDL_SESSION" in
@@ -95,10 +104,15 @@ jobs:
           total=${#links[@]}
           done_count=0
           failed=()
+          rest=()
           # Each link is handled to the end before the next, so its Negavid link
           # arrives early and one bad link doesn't stop the rest.
           for i in "${!links[@]}"; do
             n=$((i + 1))
+            if [ "$i" -gt 0 ] && [ $(( $(date +%s) - JOB_START )) -ge $((BUDGET_MINUTES * 60)) ]; then
+              rest=("${links[@]:$i}")
+              break
+            fi
             echo "::group::video $n/$total"
             out="$RUNNER_TEMP/out/$n"
             mkdir -p "$out"
@@ -109,11 +123,11 @@ jobs:
               # Only error lines: progress lines carry file names, errors don't.
               grep -iE 'error|fail|unauthori|login|session|invalid|private|not found|flood|denied' "$RUNNER_TEMP/tdl.log" | tail -n 8
               echo "::error::video $n: download failed"
-              failed+=("$n"); echo "::endgroup::"; continue
+              failed+=("${links[$i]}"); echo "::endgroup::"; continue
             fi
             if [ -z "$(find "$out" -type f)" ]; then
               echo "::error::video $n: nothing downloaded"
-              failed+=("$n"); echo "::endgroup::"; continue
+              failed+=("${links[$i]}"); echo "::endgroup::"; continue
             fi
             echo "downloaded $(du -sh "$out" | cut -f1)"
 
@@ -145,12 +159,32 @@ jobs:
               done_count=$((done_count + 1))
             else
               echo "::error::video $n: upload failed"
-              failed+=("$n")
+              failed+=("${links[$i]}")
             fi
             echo "::endgroup::"
           done
 
+          # The bot chat is private, so failed and leftover links go there in
+          # full, ready to paste again; the log only shows counts.
           summary="تمام شد: $done_count از $total ویدیو موفق."
-          [ ${#failed[@]} -eq 0 ] || summary="$summary"$'\n'"ناموفق: ${failed[*]}"
+          if [ ${#failed[@]} -gt 0 ]; then
+            summary="$summary"$'\n\n'"ناموفق (${#failed[@]}):"$'\n'"$(printf '%s\n' "${failed[@]}")"
+          fi
+          if [ ${#rest[@]} -gt 0 ]; then
+            echo "time budget reached, ${#rest[@]} video(s) left"
+            body=$(jq -n --arg ref "$GITHUB_REF_NAME" --arg links "${rest[*]}" \
+              '{ref: $ref, inputs: {links: $links}}')
+            code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/fetch.yml/dispatches" \
+              -d "$body" || true)
+            echo "continue run: $code"
+            if [ "$code" = 204 ]; then
+              summary="$summary"$'\n\n'"${#rest[@]} ویدیوی باقی‌مانده خودکار به اجرای بعدی رفت."
+            else
+              summary="$summary"$'\n\n'"اجرای بعدی شروع نشد؛ این‌ها مانده‌اند:"$'\n'"$(printf '%s\n' "${rest[@]}")"
+              failed+=("${rest[@]}")
+            fi
+          fi
           send "$summary"
           [ ${#failed[@]} -eq 0 ]
