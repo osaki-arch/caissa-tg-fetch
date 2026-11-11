@@ -25,7 +25,8 @@ env:
 
 jobs:
   hls:
-    runs-on: ubuntu-latest
+    # ubuntu-latest (moving to Ubuntu 26) left runs queued on 2026-11-11.
+    runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
       - name: Mask the links
