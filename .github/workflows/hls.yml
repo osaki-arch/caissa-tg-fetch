@@ -82,17 +82,18 @@ jobs:
             out="$RUNNER_TEMP/out/$n"
             mkdir -p "$out"
             # Subtitles (e.g. Vimeo's auto English) come along when the playlist has them.
-            if ! "$RUNNER_TEMP/yt-dlp" -q --no-warnings --no-progress -N 8 \
-                 -f 'bv*+ba/b' --merge-output-format mp4 \
-                 --write-subs --sub-langs all --ignore-errors \
-                 -o "$out/video.%(ext)s" "${urls[$i]}" > "$RUNNER_TEMP/ytdlp.log" 2>&1 \
-               || [ -z "$(find "$out" -name 'video.mp4')" ]; then
-              # Error lines only, with every URL replaced: yt-dlp shortens URLs, so masking misses them.
-              grep -iE 'error' "$RUNNER_TEMP/ytdlp.log" | sed -E 's#https?://[^ ]+#<url>#g' | tail -n 8
-              if [ -z "$(find "$out" -name 'video.mp4')" ]; then
-                echo "::error::video $n: download failed"
-                failed+=("${urls[$i]}"); rm -rf "$out"; echo "::endgroup::"; continue
-              fi
+            code=0
+            "$RUNNER_TEMP/yt-dlp" --no-warnings --no-progress -N 8 \
+              -f 'bv*+ba/b' --merge-output-format mp4 \
+              --write-subs --sub-langs all --ignore-errors \
+              -o "$out/video.%(ext)s" "${urls[$i]}" > "$RUNNER_TEMP/ytdlp.log" 2>&1 || code=$?
+            if [ -z "$(find "$out" -name 'video.mp4')" ]; then
+              # Every URL is replaced: yt-dlp shortens URLs, so masking misses them.
+              echo "yt-dlp exit code: $code"
+              echo "files: $(ls "$out" | tr '\n' ' ')"
+              sed -E 's#https?://[^ ]+#<url>#g' "$RUNNER_TEMP/ytdlp.log" | tail -n 15
+              echo "::error::video $n: download failed"
+              failed+=("${urls[$i]}"); rm -rf "$out"; echo "::endgroup::"; continue
             fi
             echo "downloaded $(du -sh "$out" | cut -f1)"
 
