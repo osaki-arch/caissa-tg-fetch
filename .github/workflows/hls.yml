@@ -1,0 +1,134 @@
+# HLS (.m3u8) → Arvan Object Storage → link over the Telegram bot.
+#
+# Same rules as fetch.yml: the repo is public, so the logs must never show the
+# input URL, a file name or the download link. URLs in error lines are replaced.
+name: hls
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: m3u8 links, separated by spaces (signed links expire in about an hour)
+        required: true
+
+env:
+  KEEP_HOURS: 24
+  AWS_DEFAULT_REGION: us-east-1
+  AWS_ENDPOINT_URL: ${{ secrets.ARVAN_ENDPOINT }}
+  AWS_ACCESS_KEY_ID: ${{ secrets.ARVAN_ACCESS_KEY }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.ARVAN_SECRET_KEY }}
+  AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+  AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+  AWS_RETRY_MODE: standard
+  AWS_MAX_ATTEMPTS: 10
+  BUCKET: ${{ secrets.ARVAN_BUCKET }}
+
+jobs:
+  hls:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Mask the links
+        env:
+          URLS: ${{ inputs.urls }}
+        run: |
+          echo "::add-mask::$URLS"
+          for u in $URLS; do echo "::add-mask::$u"; done
+
+      - name: Delete files older than ${{ env.KEEP_HOURS }}h
+        continue-on-error: true
+        timeout-minutes: 2
+        env:
+          AWS_MAX_ATTEMPTS: 2
+        run: |
+          set -o pipefail
+          cutoff=$(date -u -d "-${KEEP_HOURS} hours" +%Y-%m-%dT%H:%M:%S)
+          aws s3api list-objects-v2 --bucket "$BUCKET" \
+            --query "Contents[?LastModified<'${cutoff}'].Key" --output text |
+            tr '\t' '\n' | { grep -v -e '^None$' -e '^$' || true; } |
+            while read -r key; do aws s3 rm "s3://$BUCKET/$key" --only-show-errors; done
+          echo "old files cleaned"
+
+      - name: Install yt-dlp
+        run: |
+          curl -sSL -o "$RUNNER_TEMP/yt-dlp" https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux
+          chmod +x "$RUNNER_TEMP/yt-dlp"
+
+      - name: Fetch each video, upload it and send its link
+        env:
+          URLS: ${{ inputs.urls }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          aws configure set default.s3.preferred_transfer_client classic
+          aws configure set default.s3.multipart_chunksize 16MB
+          aws configure set default.s3.max_concurrent_requests 16
+
+          send() {
+            curl -sS -o /dev/null -w "telegram: %{http_code}\n" \
+              "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TG_CHAT_ID}" \
+              --data-urlencode "text=$1" \
+              --data-urlencode "disable_web_page_preview=true" || true
+          }
+
+          read -ra urls <<< "$URLS"
+          total=${#urls[@]}
+          done_count=0
+          failed=()
+          for i in "${!urls[@]}"; do
+            n=$((i + 1))
+            echo "::group::video $n/$total"
+            out="$RUNNER_TEMP/out/$n"
+            mkdir -p "$out"
+            # Subtitles (e.g. Vimeo's auto English) come along when the playlist has them.
+            if ! "$RUNNER_TEMP/yt-dlp" -q --no-warnings --no-progress -N 8 \
+                 -f 'bv*+ba/b' --merge-output-format mp4 \
+                 --write-subs --sub-langs all --ignore-errors \
+                 -o "$out/video.%(ext)s" "${urls[$i]}" > "$RUNNER_TEMP/ytdlp.log" 2>&1 \
+               || [ -z "$(find "$out" -name 'video.mp4')" ]; then
+              # Error lines only, with every URL replaced: yt-dlp shortens URLs, so masking misses them.
+              grep -iE 'error' "$RUNNER_TEMP/ytdlp.log" | sed -E 's#https?://[^ ]+#<url>#g' | tail -n 8
+              if [ -z "$(find "$out" -name 'video.mp4')" ]; then
+                echo "::error::video $n: download failed"
+                failed+=("${urls[$i]}"); rm -rf "$out"; echo "::endgroup::"; continue
+              fi
+            fi
+            echo "downloaded $(du -sh "$out" | cut -f1)"
+
+            msg="ویدیو $n از $total (لینک ${KEEP_HOURS} ساعت می‌ماند):"
+            ok=1
+            for f in "$out"/*; do
+              name=$(basename "$f")
+              key="$(openssl rand -hex 16).${name#video.}"
+              uploaded=0
+              for attempt in 1 2 3; do
+                if aws s3 cp "$f" "s3://$BUCKET/$key" --acl public-read --only-show-errors \
+                     2> "$RUNNER_TEMP/aws.log"; then
+                  uploaded=1; break
+                fi
+                echo "upload attempt $attempt failed: $(grep -oE 'AWS_ERROR_[A-Z_]+|\([A-Za-z]+\)|[A-Za-z]+Error' "$RUNNER_TEMP/aws.log" | sort -u | tr '\n' ' ')"
+              done
+              if [ "$uploaded" = 1 ]; then
+                msg="$msg"$'\n\n'"$name"$'\n'"${AWS_ENDPOINT_URL%/}/$BUCKET/$key"
+              else
+                ok=0
+              fi
+            done
+            rm -rf "$out"
+            if [ "$ok" = 1 ]; then
+              send "$msg"
+              done_count=$((done_count + 1))
+            else
+              echo "::error::video $n: upload failed"
+              failed+=("${urls[$i]}")
+            fi
+            echo "::endgroup::"
+          done
+
+          summary="تمام شد: $done_count از $total ویدیو موفق."
+          if [ ${#failed[@]} -gt 0 ]; then
+            summary="$summary"$'\n\n'"ناموفق: ${#failed[@]} (لینک امضاشده‌ی تازه بگیر و دوباره بفرست)"
+          fi
+          send "$summary"
+          [ ${#failed[@]} -eq 0 ]
